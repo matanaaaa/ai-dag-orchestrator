@@ -1,0 +1,20 @@
+{
+  "version": "v1",
+  "operators": [
+    {
+      "type": "download",
+      "description": "Return a text payload (mock). params: {text?: string}",
+      "params": { "text": "string" }
+    },
+    {
+      "type": "transform_upper",
+      "description": "Uppercase the upstream output. params: {}",
+      "params": {}
+    },
+    {
+      "type": "upload_local",
+      "description": "Write upstream output to local file. params: {filename?: string}",
+      "params": { "filename": "string" }
+    }
+  ]
+}
