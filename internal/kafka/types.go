@@ -20,6 +20,8 @@ const (
 	TypePlanResult    = "PLAN_RESULT"
 	TypeNodeDispatch  = "NODE_DISPATCH"
 	TypeNodeStatus    = "NODE_STATUS"
+	TypeNodeRetry     = "NODE_RETRY"
+	TypeNodeDLQ       = "NODE_DLQ"
 )
 
 type JobSubmitPayload struct {
@@ -31,6 +33,10 @@ type PlanResultPayload struct {
 	OK  bool   `json:"ok"`
 	DAG dsl.DAG `json:"dag"`
 	Err string `json:"err,omitempty"`
+
+	PlannerModel     string `json:"planner_model,omitempty"`
+    PlannerLatencyMs int64  `json:"planner_latency_ms,omitempty"`
+    RepairRounds     int    `json:"repair_rounds,omitempty"`
 }
 
 type NodeDispatchPayload struct {
@@ -50,4 +56,22 @@ type NodeStatusPayload struct {
 	OutputText  string `json:"output_text,omitempty"`
 	ArtifactURI string `json:"artifact_uri,omitempty"`
 	ErrorMsg    string `json:"error_msg,omitempty"`
+}
+
+type NodeRetryPayload struct {
+	Node        dsl.Node `json:"node"`
+	NotBeforeMs int64    `json:"not_before_ms"`
+	Reason      string   `json:"reason,omitempty"`
+	Context     struct {
+		UpstreamOutputs map[string]string `json:"upstream_outputs,omitempty"`
+	} `json:"context"`
+}
+
+type NodeDLQPayload struct {
+	Node         dsl.Node `json:"node"`
+	FinalAttempt int      `json:"final_attempt"`
+	Reason       string   `json:"reason"`
+	Context      struct {
+		UpstreamOutputs map[string]string `json:"upstream_outputs,omitempty"`
+	} `json:"context"`
 }

@@ -3,18 +3,24 @@ package main
 import (
 	"context"
 	"log"
-
-	"github.com/matanaaaa/ai-dag-orchestrator/internal/orchestrator"
-	"github.com/matanaaaa/ai-dag-orchestrator/internal/config"
-	"github.com/matanaaaa/ai-dag-orchestrator/internal/kafka"
-	"github.com/matanaaaa/ai-dag-orchestrator/internal/store"
+	"net/http"
+	"time"
 
 	"github.com/IBM/sarama"
+
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/config"
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/kafka"
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/observability"
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/orchestrator"
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/store"
 )
 
 func main() {
 	cfg := config.Load()
 	cfg.MustValidate()
+
+	reg := observability.NewRegistry()
+	go serveMetrics(cfg.MetricsAddr, reg)
 
 	st, err := store.Open(cfg.MySQLDSN)
 	if err != nil {
@@ -33,11 +39,17 @@ func main() {
 		PlanResult: cfg.TopicPlanResult,
 		Dispatch:   cfg.TopicDispatch,
 		NodeStatus: cfg.TopicNodeStatus,
+		Retry:      cfg.TopicNodeRetry,
+		DLQ:        cfg.TopicNodeDLQ,
 	}
 
-	eng := &orchestrator.Engine{Store: st, Prod: prod, Topics: topics}
+	eng := &orchestrator.Engine{
+		Store: st, Prod: prod, Topics: topics,
+		MaxRetry: cfg.NodeMaxRetry, RetryBackoffMs: cfg.RetryBackoffMs, Metrics: reg,
+	}
 
 	handler := func(ctx context.Context, msg *sarama.ConsumerMessage) error {
+		reg.SetGauge("orchestrator_queue_lag_ms", map[string]string{"topic": msg.Topic}, float64(time.Now().UnixMilli()-msg.Timestamp.UnixMilli()))
 		switch msg.Topic {
 		case topics.PlanResult:
 			return eng.HandlePlanResult(ctx, msg.Value)
@@ -56,4 +68,12 @@ func main() {
 
 	log.Printf("[orchestrator] consuming %s,%s", topics.PlanResult, topics.NodeStatus)
 	log.Fatal(cons.Run(context.Background()))
+}
+
+func serveMetrics(addr string, reg *observability.Registry) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", reg.Handler())
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Printf("[orchestrator] metrics server stopped: %v", err)
+	}
 }
