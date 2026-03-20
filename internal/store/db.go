@@ -1,14 +1,22 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 type Store struct {
 	DB *sql.DB
+}
+
+type Querier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 func Open(dsn string) (*Store, error) {
@@ -27,3 +35,21 @@ func Open(dsn string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
+
+func (s *Store) WithTx(ctx context.Context, fn func(q Querier) error) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func IsDuplicateKey(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}

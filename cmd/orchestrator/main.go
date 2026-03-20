@@ -39,7 +39,6 @@ func main() {
 		PlanResult: cfg.TopicPlanResult,
 		Dispatch:   cfg.TopicDispatch,
 		NodeStatus: cfg.TopicNodeStatus,
-		Retry:      cfg.TopicNodeRetry,
 		DLQ:        cfg.TopicNodeDLQ,
 	}
 
@@ -47,6 +46,16 @@ func main() {
 		Store: st, Prod: prod, Topics: topics,
 		MaxRetry: cfg.NodeMaxRetry, RetryBackoffMs: cfg.RetryBackoffMs, Metrics: reg,
 	}
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := eng.RecoverPendingDispatches(context.Background(), 50); err != nil {
+				log.Printf("[orchestrator] recover dispatches: %v", err)
+			}
+		}
+	}()
 
 	handler := func(ctx context.Context, msg *sarama.ConsumerMessage) error {
 		reg.SetGauge("orchestrator_queue_lag_ms", map[string]string{"topic": msg.Topic}, float64(time.Now().UnixMilli()-msg.Timestamp.UnixMilli()))

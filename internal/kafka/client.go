@@ -92,7 +92,6 @@ func (h *cgHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.
 		if err != nil {
 			log.Printf("[kafka] handler error topic=%s partition=%d offset=%d err=%v",
 				msg.Topic, msg.Partition, msg.Offset, err)
-			// P0：不做重试，直接 mark 避免卡住。P1 再引入 retry/DLQ
 		}
 		sess.MarkMessage(msg, fmt.Sprintf("handled_at=%d", time.Now().UnixMilli()))
 	}

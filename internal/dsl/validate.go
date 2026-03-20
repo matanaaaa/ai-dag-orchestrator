@@ -38,6 +38,12 @@ func Validate(d DAG) (Validated, error) {
 		indeg[id] = 0
 	}
 
+	type edgeKey struct {
+		From string
+		To   string
+	}
+	seenEdges := map[edgeKey]struct{}{}
+
 	for _, e := range d.Edges {
 		if e.From == "" || e.To == "" {
 			return Validated{}, fmt.Errorf("edge from/to empty: %+v", e)
@@ -48,6 +54,13 @@ func Validate(d DAG) (Validated, error) {
 		if _, ok := nodeByID[e.To]; !ok {
 			return Validated{}, fmt.Errorf("edge to missing node: %s", e.To)
 		}
+
+		k := edgeKey{From: e.From, To: e.To}
+		if _, ok := seenEdges[k]; ok {
+			return Validated{}, fmt.Errorf("duplicate edge: %s -> %s", e.From, e.To)
+		}
+		seenEdges[k] = struct{}{}
+		
 		adj[e.From] = append(adj[e.From], e.To)
 		indeg[e.To]++
 	}

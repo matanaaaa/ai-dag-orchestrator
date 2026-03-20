@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/config"
+	"github.com/matanaaaa/ai-dag-orchestrator/internal/dsl"
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/kafka"
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/store"
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/util"
-	"github.com/matanaaaa/ai-dag-orchestrator/internal/dsl"
 )
 
 type submitReq struct {
@@ -43,7 +43,6 @@ func main() {
 		PlanResult: cfg.TopicPlanResult,
 		Dispatch:   cfg.TopicDispatch,
 		NodeStatus: cfg.TopicNodeStatus,
-		Retry:      cfg.TopicNodeRetry,
 		DLQ:        cfg.TopicNodeDLQ,
 	}
 
@@ -174,7 +173,7 @@ func main() {
 				"latency_ms":    j.PlannerLatencyMs,
 				"repair_rounds": j.RepairRounds,
 			},
-			"nodes": nodes,
+			"nodes":         nodes,
 			"child_job_ids": childIDs,
 		}
 
@@ -299,11 +298,11 @@ func serveJobDAGDot(w http.ResponseWriter, r *http.Request, st *store.Store, job
 
 	// 确认 job 存在（顺便拿 version/model 也行）
 	if _, err := st.GetJob(ctx, jobID); err != nil {
-		http.Error(w, "job not found: "+err.Error(), 404)
+		http.Error(w, "job not found: "+err.Error(), 500)
 		return
 	}
 
-	// 1) 从 job_nodes 拿节点 id/type（params 你 DB 里不存，DOT 不需要 params）
+	// 1) 从 job_nodes 拿节点 id/type
 	nrows, err := st.DB.QueryContext(ctx,
 		`SELECT node_id, node_type
 		 FROM job_nodes
@@ -329,7 +328,7 @@ func serveJobDAGDot(w http.ResponseWriter, r *http.Request, st *store.Store, job
 		})
 	}
 
-	// 2) 从 job_edges 拿边（如果你表名/字段名不同，把 SQL 改成你真实的）
+	// 2) 从 job_edges 拿边
 	erows, err := st.DB.QueryContext(ctx,
 		`SELECT from_node, to_node
 		FROM job_edges
@@ -356,12 +355,6 @@ func serveJobDAGDot(w http.ResponseWriter, r *http.Request, st *store.Store, job
 		Nodes:      nodes,
 		Edges:      edges,
 	}
-
-	// 可选：如果你想确保这是合法 DAG，也可以 Validate 一下（失败就返回 500）
-	// if _, err := dsl.Validate(dag); err != nil {
-	// 	http.Error(w, "dag invalid: "+err.Error(), 500)
-	// 	return
-	// }
 
 	dot := dag.ToDOT()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

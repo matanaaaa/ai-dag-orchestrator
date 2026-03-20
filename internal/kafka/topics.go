@@ -5,6 +5,5 @@ type Topics struct {
 	PlanResult string
 	Dispatch   string
 	NodeStatus string
-	Retry      string
 	DLQ        string
 }

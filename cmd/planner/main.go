@@ -37,7 +37,6 @@ func main() {
 		PlanResult: cfg.TopicPlanResult,
 		Dispatch:   cfg.TopicDispatch,
 		NodeStatus: cfg.TopicNodeStatus,
-		Retry:      cfg.TopicNodeRetry,
 		DLQ:        cfg.TopicNodeDLQ,
 	}
 
@@ -150,7 +149,7 @@ func main() {
 			Payload: payload,
 		}
 		log.Printf("[planner] publish plan_result job_id=%s planner_model=%s fallback=%v",
-    		env.JobID, meta.Model, meta.Model == "fallback")
+			env.JobID, meta.Model, meta.Model == "fallback")
 		return prod.Publish(topics.PlanResult, env.JobID, out)
 	}
 

@@ -13,6 +13,7 @@ type NodeRow struct {
 	ParamsJSON        string
 	Status            string
 	IndegreeRemaining int
+	CurrentAttempt    int
 }
 
 type EdgeRow struct {
@@ -21,28 +22,44 @@ type EdgeRow struct {
 }
 
 type NodeResultRow struct {
-	JobID      string
-	NodeID     string
-	OutputText sql.NullString
+	JobID       string
+	NodeID      string
+	OutputText  sql.NullString
 	ArtifactURI sql.NullString
-	ErrorMsg   sql.NullString
+	ErrorMsg    sql.NullString
 }
 
 func (s *Store) InsertNode(ctx context.Context, jobID, nodeID, nodeType string, params any, status string, indegree int) error {
+	return insertNode(ctx, s.DB, jobID, nodeID, nodeType, params, status, indegree)
+}
+
+func (s *Store) InsertNodeTx(ctx context.Context, q Querier, jobID, nodeID, nodeType string, params any, status string, indegree int) error {
+	return insertNode(ctx, q, jobID, nodeID, nodeType, params, status, indegree)
+}
+
+func insertNode(ctx context.Context, q Querier, jobID, nodeID, nodeType string, params any, status string, indegree int) error {
 	b, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx,
-		`INSERT INTO job_nodes(job_id,node_id,node_type,params_json,status,indegree_remaining)
-		 VALUES(?,?,?,?,?,?)`,
+	_, err = q.ExecContext(ctx,
+		`INSERT IGNORE INTO job_nodes(job_id,node_id,node_type,params_json,status,indegree_remaining,current_attempt,not_before_ms)
+		 VALUES(?,?,?,?,?,?,1,NULL)`,
 		jobID, nodeID, nodeType, string(b), status, indegree)
 	return err
 }
 
 func (s *Store) InsertEdge(ctx context.Context, jobID, from, to string) error {
-	_, err := s.DB.ExecContext(ctx,
-		`INSERT INTO job_edges(job_id,from_node,to_node) VALUES(?,?,?)`,
+	return insertEdge(ctx, s.DB, jobID, from, to)
+}
+
+func (s *Store) InsertEdgeTx(ctx context.Context, q Querier, jobID, from, to string) error {
+	return insertEdge(ctx, q, jobID, from, to)
+}
+
+func insertEdge(ctx context.Context, q Querier, jobID, from, to string) error {
+	_, err := q.ExecContext(ctx,
+		`INSERT IGNORE INTO job_edges(job_id,from_node,to_node) VALUES(?,?,?)`,
 		jobID, from, to)
 	return err
 }
@@ -67,7 +84,15 @@ func (s *Store) ListDownstream(ctx context.Context, jobID, from string) ([]strin
 }
 
 func (s *Store) MarkNodeStatus(ctx context.Context, jobID, nodeID, status string) error {
-	_, err := s.DB.ExecContext(ctx,
+	return markNodeStatus(ctx, s.DB, jobID, nodeID, status)
+}
+
+func (s *Store) MarkNodeStatusTx(ctx context.Context, q Querier, jobID, nodeID, status string) error {
+	return markNodeStatus(ctx, q, jobID, nodeID, status)
+}
+
+func markNodeStatus(ctx context.Context, q Querier, jobID, nodeID, status string) error {
+	_, err := q.ExecContext(ctx,
 		`UPDATE job_nodes SET status=? WHERE job_id=? AND node_id=?`,
 		status, jobID, nodeID)
 	return err
@@ -132,7 +157,15 @@ func (s *Store) CountAllNodes(ctx context.Context, jobID string) (int, error) {
 }
 
 func (s *Store) UpsertNodeResult(ctx context.Context, jobID, nodeID, outputText, artifactURI, errorMsg string) error {
-	_, err := s.DB.ExecContext(ctx,
+	return upsertNodeResult(ctx, s.DB, jobID, nodeID, outputText, artifactURI, errorMsg)
+}
+
+func (s *Store) UpsertNodeResultTx(ctx context.Context, q Querier, jobID, nodeID, outputText, artifactURI, errorMsg string) error {
+	return upsertNodeResult(ctx, q, jobID, nodeID, outputText, artifactURI, errorMsg)
+}
+
+func upsertNodeResult(ctx context.Context, q Querier, jobID, nodeID, outputText, artifactURI, errorMsg string) error {
+	_, err := q.ExecContext(ctx,
 		`INSERT INTO node_results(job_id,node_id,output_text,artifact_uri,error_msg)
 		 VALUES(?,?,?,?,?)
 		 ON DUPLICATE KEY UPDATE output_text=VALUES(output_text), artifact_uri=VALUES(artifact_uri), error_msg=VALUES(error_msg)`,

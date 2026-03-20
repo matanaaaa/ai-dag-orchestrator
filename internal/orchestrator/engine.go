@@ -2,10 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"time"
 	"strings"
+	"time"
 
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/dsl"
 	"github.com/matanaaaa/ai-dag-orchestrator/internal/kafka"
@@ -34,33 +35,95 @@ func (e *Engine) HandlePlanResult(ctx context.Context, msgValue []byte) error {
 	pr := env.Payload.RepairRounds
 
 	if !env.Payload.OK {
-		_ = e.Store.InsertJob(ctx, store.Job{
+		if err := e.Store.InsertJob(ctx, store.Job{
 			JobID: env.JobID, TraceID: env.TraceID, Status: "FAILED", UserRequest: "planner failed", FailedReason: env.Payload.Err,
 			PlannerModel: pm, PlannerLatencyMs: pl, RepairRounds: pr,
-		})
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
 	v, err := dsl.Validate(env.Payload.DAG)
 	if err != nil {
-		_ = e.Store.InsertJob(ctx, store.Job{
+		if err := e.Store.InsertJob(ctx, store.Job{
 			JobID: env.JobID, TraceID: env.TraceID, Status: "FAILED", UserRequest: "invalid dag", FailedReason: err.Error(),
 			PlannerModel: pm, PlannerLatencyMs: pl, RepairRounds: pr,
-		})
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
 
-	_ = e.Store.InsertJob(ctx, store.Job{
-		JobID: env.JobID, TraceID: env.TraceID, Status: "RUNNING", UserRequest: "(from submit)",
-		PlannerModel: pm, PlannerLatencyMs: pl, RepairRounds: pr,
-	})
+	shouldDispatch := true
+	if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+		existing, err := e.Store.GetJobTx(ctx, q, env.JobID)
+		switch {
+		case err == nil:
+			if existing.Status == "SUCCEEDED" || existing.Status == "FAILED" || existing.Status == "REPLANNED" {
+				shouldDispatch = false
+				return nil
+			}
+		case err != nil && err != sql.ErrNoRows:
+			return err
+		}
 
-	for id, n := range v.NodeByID {
-		deg := v.Indegree[id]
-		_ = e.Store.InsertNode(ctx, env.JobID, n.ID, n.Type, n.Params, "PENDING", deg)
+		claimed := false
+		switch {
+		case err == sql.ErrNoRows:
+			if err := e.Store.InsertJobTx(ctx, q, store.Job{
+				JobID:            env.JobID,
+				TraceID:          env.TraceID,
+				Status:           "RUNNING",
+				UserRequest:      "(from submit)",
+				PlannerModel:     pm,
+				PlannerLatencyMs: pl,
+				RepairRounds:     pr,
+			}); err != nil {
+				return err
+			}
+			claimed = true
+		case err == nil:
+			claimed, err = e.Store.TryStartJobPlanInitialization(ctx, q, store.Job{
+				JobID:            env.JobID,
+				TraceID:          env.TraceID,
+				PlannerModel:     pm,
+				PlannerLatencyMs: pl,
+				RepairRounds:     pr,
+			})
+			if err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+		if !claimed {
+			shouldDispatch = false
+			return nil
+		}
+
+		for id, n := range v.NodeByID {
+			deg := v.Indegree[id]
+			if err := e.Store.InsertNodeTx(ctx, q, env.JobID, n.ID, n.Type, n.Params, "PENDING", deg); err != nil {
+				return err
+			}
+		}
+		for _, ed := range env.Payload.DAG.Edges {
+			if err := e.Store.InsertEdgeTx(ctx, q, env.JobID, ed.From, ed.To); err != nil {
+				return err
+			}
+		}
+		return e.Store.InsertNodeEventTx(ctx, q, store.NodeEvent{
+			EventID: env.EventID,
+			JobID:   env.JobID,
+			Status:  "PLAN_ACCEPTED",
+			TSMs:    time.Now().UnixMilli(),
+		})
+	}); err != nil {
+		return err
 	}
-	for _, ed := range env.Payload.DAG.Edges {
-		_ = e.Store.InsertEdge(ctx, env.JobID, ed.From, ed.To)
+	if !shouldDispatch {
+		return nil
 	}
 
 	ready, err := e.Store.ListReadyNodes(ctx, env.JobID)
@@ -73,12 +136,6 @@ func (e *Engine) HandlePlanResult(ctx context.Context, msgValue []byte) error {
 		}
 	}
 
-	_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-		EventID: util.NewID("ev"),
-		JobID:   env.JobID,
-		Status:  "PLAN_ACCEPTED",
-		TSMs:    time.Now().UnixMilli(),
-	})
 	return nil
 }
 
@@ -93,27 +150,39 @@ func (e *Engine) HandleNodeStatus(ctx context.Context, msgValue []byte) error {
 
 	switch env.Payload.Status {
 	case "STARTED":
-		_ = e.Store.MarkNodeStatus(ctx, env.JobID, env.NodeID, "RUNNING")
-		_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-			EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "STARTED",
-			Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID,
-		})
+		if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+			started, err := e.Store.TryMarkNodeRunningAttempt(ctx, q, env.JobID, env.NodeID, env.Attempt)
+			if err != nil {
+				return err
+			}
+			if !started {
+				return nil
+			}
+			return e.Store.InsertNodeEventTx(ctx, q, store.NodeEvent{
+				EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "STARTED",
+				Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID,
+			})
+		}); err != nil {
+			return err
+		}
 		return nil
 
 	case "SUCCEEDED":
-		current, _ := e.Store.GetNodeStatus(ctx, env.JobID, env.NodeID)
-		if current == "SUCCEEDED" {
+		finalized := false
+		if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+			var err error
+			finalized, err = e.Store.TryFinalizeNodeSucceeded(ctx, q, store.NodeEvent{
+				EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "SUCCEEDED",
+				Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID,
+				OutputText: env.Payload.OutputText, ArtifactURI: env.Payload.ArtifactURI,
+			})
+			return err
+		}); err != nil {
+			return err
+		}
+		if !finalized {
 			return nil
 		}
-
-		_ = e.Store.MarkNodeStatus(ctx, env.JobID, env.NodeID, "SUCCEEDED")
-		_ = e.Store.UpdateNodeAttemptStatus(ctx, env.JobID, env.NodeID, env.Attempt, "SUCCEEDED", "")
-		_ = e.Store.UpsertNodeResult(ctx, env.JobID, env.NodeID, env.Payload.OutputText, env.Payload.ArtifactURI, "")
-		_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-			EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "SUCCEEDED",
-			Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID,
-			OutputText: env.Payload.OutputText, ArtifactURI: env.Payload.ArtifactURI,
-		})
 
 		down, err := e.Store.ListDownstream(ctx, env.JobID, env.NodeID)
 		if err != nil {
@@ -131,63 +200,71 @@ func (e *Engine) HandleNodeStatus(ctx context.Context, msgValue []byte) error {
 			}
 		}
 
-		total, err := e.Store.CountAllNodes(ctx, env.JobID)
-		if err != nil {
-			return err
-		}
-		succ, err := e.Store.CountNodesByStatus(ctx, env.JobID, "SUCCEEDED")
-		if err != nil {
-			return err
-		}
-		if total > 0 && succ == total {
-			_ = e.Store.UpdateJobStatus(ctx, env.JobID, "SUCCEEDED")
-			_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
+		jobDone := false
+		if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+			var err error
+			jobDone, err = e.Store.TryMarkJobSucceeded(ctx, q, env.JobID)
+			if err != nil || !jobDone {
+				return err
+			}
+			return e.Store.InsertNodeEventTx(ctx, q, store.NodeEvent{
 				EventID: util.NewID("ev"),
 				JobID:   env.JobID,
 				Status:  "JOB_SUCCEEDED",
 				TSMs:    time.Now().UnixMilli(),
 			})
+		}); err != nil {
+			return err
 		}
 		return nil
 
 	case "FAILED":
-		_ = e.Store.MarkNodeStatus(ctx, env.JobID, env.NodeID, "FAILED")
-		_ = e.Store.UpdateNodeAttemptStatus(ctx, env.JobID, env.NodeID, env.Attempt, "FAILED", env.Payload.ErrorMsg)
-		_ = e.Store.UpsertNodeResult(ctx, env.JobID, env.NodeID, "", "", env.Payload.ErrorMsg)
-		_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-			EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "FAILED",
-			Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID, ErrorMsg: env.Payload.ErrorMsg,
-		})
-
 		if env.Attempt < e.MaxRetry {
 			nextAttempt := env.Attempt + 1
-			retryPayload, err := e.buildRetryPayload(ctx, env.JobID, env.NodeID)
-			if err != nil {
+			notBeforeMs := time.Now().Add(time.Duration(e.RetryBackoffMs) * time.Millisecond).UnixMilli()
+			scheduled := false
+			if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+				var err error
+				scheduled, err = e.Store.TryScheduleNodeRetry(ctx, q, store.NodeEvent{
+					EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "FAILED",
+					Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID, ErrorMsg: env.Payload.ErrorMsg,
+				}, nextAttempt, notBeforeMs)
+				if err != nil || !scheduled {
+					return err
+				}
+				return e.Store.InsertNodeEventTx(ctx, q, store.NodeEvent{
+					EventID:  util.NewID("ev"),
+					JobID:    env.JobID,
+					NodeID:   env.NodeID,
+					Status:   "RETRY_SCHEDULED",
+					Attempt:  nextAttempt,
+					TSMs:     time.Now().UnixMilli(),
+					ErrorMsg: env.Payload.ErrorMsg,
+				})
+			}); err != nil {
 				return err
 			}
-			retryPayload.NotBeforeMs = time.Now().Add(time.Duration(e.RetryBackoffMs) * time.Millisecond).UnixMilli()
-			retryPayload.Reason = env.Payload.ErrorMsg
-
-			retryEnv := kafka.Envelope[kafka.NodeRetryPayload]{
-				EventID: util.NewID("ev"),
-				Type:    kafka.TypeNodeRetry,
-				TSMs:    time.Now().UnixMilli(),
-				TraceID: env.TraceID,
-				JobID:   env.JobID,
-				NodeID:  env.NodeID,
-				Attempt: nextAttempt,
-				Payload: retryPayload,
-			}
-			if err := e.Prod.Publish(e.Topics.Retry, env.JobID, retryEnv); err != nil {
-				return err
+			if !scheduled {
+				return nil
 			}
 			if e.Metrics != nil {
 				e.Metrics.IncCounter("worker_retry_total", nil, 1)
 			}
-			_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-				EventID: util.NewID("ev"), JobID: env.JobID, NodeID: env.NodeID,
-				Status: "RETRY_SCHEDULED", Attempt: nextAttempt, TSMs: time.Now().UnixMilli(), ErrorMsg: env.Payload.ErrorMsg,
+			return nil
+		}
+
+		finalized := false
+		if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+			var err error
+			finalized, err = e.Store.TryFinalizeNodeFailed(ctx, q, store.NodeEvent{
+				EventID: env.EventID, JobID: env.JobID, NodeID: env.NodeID, Status: "FAILED",
+				Attempt: env.Attempt, TSMs: env.TSMs, WorkerID: env.Payload.Worker.ID, ErrorMsg: env.Payload.ErrorMsg,
 			})
+			return err
+		}); err != nil {
+			return err
+		}
+		if !finalized {
 			return nil
 		}
 		// terminal failure -> trigger replanning as a child job (agent loop: observe -> replan)
@@ -205,18 +282,24 @@ func (e *Engine) HandleNodeStatus(ctx context.Context, msgValue []byte) error {
 				Attempt: env.Attempt,
 				Payload: dlqPayload,
 			}
-			_ = e.Prod.Publish(e.Topics.DLQ, env.JobID, dlqEnv)
+			if err := e.Prod.Publish(e.Topics.DLQ, env.JobID, dlqEnv); err != nil {
+				return err
+			}
 		}
 
 		if replanErr != nil {
-			_ = e.Store.UpdateJobFailed(ctx, env.JobID, env.Payload.ErrorMsg+" | replan_error="+replanErr.Error())
-			_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
+			if err := e.Store.UpdateJobFailed(ctx, env.JobID, env.Payload.ErrorMsg+" | replan_error="+replanErr.Error()); err != nil {
+				return err
+			}
+			if err := e.Store.InsertNodeEvent(ctx, store.NodeEvent{
 				EventID:  util.NewID("ev"),
 				JobID:    env.JobID,
 				Status:   "JOB_FAILED",
 				TSMs:     time.Now().UnixMilli(),
 				ErrorMsg: env.Payload.ErrorMsg + " | replan_error=" + replanErr.Error(),
-			})
+			}); err != nil {
+				return err
+			}
 			return nil
 		}
 		if childJobID == "" {
@@ -229,14 +312,17 @@ func (e *Engine) HandleNodeStatus(ctx context.Context, msgValue []byte) error {
 }
 
 func (e *Engine) dispatchNode(ctx context.Context, jobID, traceID, nodeID string) error {
-	claimed, err := e.Store.TryMarkNodeReady(ctx, jobID, nodeID)
+	claimed, err := e.Store.TryStartNodeDispatch(ctx, jobID, nodeID)
 	if err != nil {
 		return err
 	}
 	if !claimed {
 		return nil
 	}
+	return e.publishNodeDispatch(ctx, jobID, traceID, nodeID, 1)
+}
 
+func (e *Engine) publishNodeDispatch(ctx context.Context, jobID, traceID, nodeID string, attempt int) error {
 	payload, err := e.buildDispatchPayload(ctx, jobID, nodeID)
 	if err != nil {
 		return err
@@ -249,19 +335,55 @@ func (e *Engine) dispatchNode(ctx context.Context, jobID, traceID, nodeID string
 		TraceID: traceID,
 		JobID:   jobID,
 		NodeID:  nodeID,
-		Attempt: 1,
+		Attempt: attempt,
 		Payload: payload,
 	}
 	if err := e.Prod.Publish(e.Topics.Dispatch, jobID, ev); err != nil {
-		return err
+		_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
+			EventID:  util.NewID("ev"),
+			JobID:    jobID,
+			NodeID:   nodeID,
+			Status:   "DISPATCH_FAILED",
+			Attempt:  attempt,
+			TSMs:     time.Now().UnixMilli(),
+			ErrorMsg: err.Error(),
+		})
+		return fmt.Errorf("publish dispatch failed: %w", err)
 	}
 	if e.Metrics != nil {
 		e.Metrics.IncCounter("orchestrator_dispatch_total", nil, 1)
 	}
-	_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-		EventID: ev.EventID, JobID: jobID, NodeID: nodeID, Status: "DISPATCHED", Attempt: 1, TSMs: ev.TSMs,
-	})
+	if err := e.Store.InsertNodeEvent(ctx, store.NodeEvent{
+		EventID: ev.EventID, JobID: jobID, NodeID: nodeID, Status: "DISPATCHED", Attempt: attempt, TSMs: ev.TSMs,
+	}); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (e *Engine) RecoverPendingDispatches(ctx context.Context, limit int) error {
+	nowMs := time.Now().UnixMilli()
+	candidates, err := e.Store.ListRecoverableDispatches(ctx, nowMs-5000, nowMs, limit)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, c := range candidates {
+		job, err := e.Store.GetJob(ctx, c.JobID)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := e.publishNodeDispatch(ctx, c.JobID, job.TraceID, c.NodeID, c.CurrentAttempt); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+	}
+	return firstErr
 }
 
 func (e *Engine) buildDispatchPayload(ctx context.Context, jobID, nodeID string) (kafka.NodeDispatchPayload, error) {
@@ -273,16 +395,25 @@ func (e *Engine) buildDispatchPayload(ctx context.Context, jobID, nodeID string)
 	upOut := map[string]string{}
 	rows, err := e.Store.DB.QueryContext(ctx,
 		`SELECT from_node FROM job_edges WHERE job_id=? AND to_node=?`, jobID, nodeID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var from string
-			if err := rows.Scan(&from); err == nil {
-				if txt, err := e.Store.GetNodeOutputText(ctx, jobID, from); err == nil && txt != "" {
-					upOut[from] = txt
-				}
-			}
+	if err != nil {
+		return kafka.NodeDispatchPayload{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var from string
+		if err := rows.Scan(&from); err != nil {
+			return kafka.NodeDispatchPayload{}, err
 		}
+		txt, err := e.Store.GetNodeOutputText(ctx, jobID, from)
+		if err != nil {
+			return kafka.NodeDispatchPayload{}, err
+		}
+		if txt != "" {
+			upOut[from] = txt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return kafka.NodeDispatchPayload{}, err
 	}
 
 	payload := kafka.NodeDispatchPayload{
@@ -290,17 +421,6 @@ func (e *Engine) buildDispatchPayload(ctx context.Context, jobID, nodeID string)
 	}
 	payload.Context.UpstreamOutputs = upOut
 	return payload, nil
-}
-
-func (e *Engine) buildRetryPayload(ctx context.Context, jobID, nodeID string) (kafka.NodeRetryPayload, error) {
-	dispatchPayload, err := e.buildDispatchPayload(ctx, jobID, nodeID)
-	if err != nil {
-		return kafka.NodeRetryPayload{}, err
-	}
-	var p kafka.NodeRetryPayload
-	p.Node = dispatchPayload.Node
-	p.Context.UpstreamOutputs = dispatchPayload.Context.UpstreamOutputs
-	return p, nil
 }
 
 func (e *Engine) buildDLQPayload(ctx context.Context, jobID, nodeID string, attempt int, reason string) (kafka.NodeDLQPayload, error) {
@@ -334,16 +454,25 @@ func (e *Engine) triggerReplanAsChildJob(ctx context.Context, parentJobID, paren
 	upOut := map[string]string{}
 	rows, qerr := e.Store.DB.QueryContext(ctx,
 		`SELECT from_node FROM job_edges WHERE job_id=? AND to_node=?`, parentJobID, failedNodeID)
-	if qerr == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var from string
-			if err := rows.Scan(&from); err == nil {
-				if txt, err := e.Store.GetNodeOutputText(ctx, parentJobID, from); err == nil && txt != "" {
-					upOut[from] = txt
-				}
-			}
+	if qerr != nil {
+		return "", qerr
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var from string
+		if err := rows.Scan(&from); err != nil {
+			return "", err
 		}
+		txt, err := e.Store.GetNodeOutputText(ctx, parentJobID, from)
+		if err != nil {
+			return "", err
+		}
+		if txt != "" {
+			upOut[from] = txt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 
 	var b strings.Builder
@@ -371,17 +500,37 @@ func (e *Engine) triggerReplanAsChildJob(ctx context.Context, parentJobID, paren
 	b.WriteString("Return only strict JSON.\n")
 	replanUserRequest := b.String()
 
-	_ = e.Store.UpdateJobStatusWithReason(ctx, parentJobID, "NEEDS_REPLAN", failedErr)
-
 	childJobID := util.NewID("job")
 	childTraceID := util.NewID("trace")
-	_ = e.Store.InsertJob(ctx, store.Job{
-		JobID:       childJobID,
-		TraceID:     childTraceID,
-		Status:      "PENDING",
-		UserRequest: replanUserRequest,
-		ParentJobID: parentJobID,
-	})
+	claimed := false
+	if err := e.Store.WithTx(ctx, func(q store.Querier) error {
+		var err error
+		claimed, err = e.Store.TryClaimJobForReplan(ctx, q, parentJobID, failedErr)
+		if err != nil || !claimed {
+			return err
+		}
+		if err := e.Store.InsertJobTx(ctx, q, store.Job{
+			JobID:       childJobID,
+			TraceID:     childTraceID,
+			Status:      "PENDING",
+			UserRequest: replanUserRequest,
+			ParentJobID: parentJobID,
+		}); err != nil {
+			return err
+		}
+		return e.Store.InsertNodeEventTx(ctx, q, store.NodeEvent{
+			EventID:  util.NewID("ev"),
+			JobID:    parentJobID,
+			Status:   "REPLAN_TRIGGERED",
+			TSMs:     time.Now().UnixMilli(),
+			ErrorMsg: "replanned_to_job=" + childJobID,
+		})
+	}); err != nil {
+		return "", err
+	}
+	if !claimed {
+		return "", nil
+	}
 
 	ev := kafka.Envelope[kafka.JobSubmitPayload]{
 		EventID: util.NewID("ev"),
@@ -392,18 +541,17 @@ func (e *Engine) triggerReplanAsChildJob(ctx context.Context, parentJobID, paren
 		Payload: kafka.JobSubmitPayload{UserRequest: replanUserRequest},
 	}
 	if err := e.Prod.Publish(e.Topics.Submit, childJobID, ev); err != nil {
-		_ = e.Store.UpdateJobFailed(ctx, childJobID, "replan submit publish failed: "+err.Error())
-		_ = e.Store.UpdateJobFailed(ctx, parentJobID, failedErr+" | replan submit publish failed: "+err.Error())
+		if updateErr := e.Store.UpdateJobFailed(ctx, childJobID, "replan submit publish failed: "+err.Error()); updateErr != nil {
+			return "", updateErr
+		}
+		if updateErr := e.Store.UpdateJobFailed(ctx, parentJobID, failedErr+" | replan submit publish failed: "+err.Error()); updateErr != nil {
+			return "", updateErr
+		}
 		return "", err
 	}
 
-	_ = e.Store.UpdateJobStatusWithReason(ctx, parentJobID, "REPLANNED", failedErr+" | replanned_to_job="+childJobID)
-	_ = e.Store.InsertNodeEvent(ctx, store.NodeEvent{
-		EventID:  util.NewID("ev"),
-		JobID:    parentJobID,
-		Status:   "REPLAN_TRIGGERED",
-		TSMs:     time.Now().UnixMilli(),
-		ErrorMsg: "replanned_to_job=" + childJobID,
-	})
+	if _, err := e.Store.TryMarkJobReplannedNow(ctx, parentJobID, failedErr+" | replanned_to_job="+childJobID); err != nil {
+		return "", err
+	}
 	return childJobID, nil
 }

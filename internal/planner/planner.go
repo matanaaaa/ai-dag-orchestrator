@@ -10,11 +10,11 @@ import (
 )
 
 type Planner struct {
-	LLM       LLMProvider
-	MaxRepair int
-	Model     string
-	SchemaAny any
-	DevPrompt string
+	LLM                  LLMProvider
+	MaxRepair            int
+	Model                string
+	SchemaAny            any
+	DevPrompt            string
 	AllowedOperatorTypes map[string]struct{}
 }
 
@@ -44,6 +44,10 @@ func (p *Planner) Plan(ctx context.Context, userRequest string) (dsl.DAG, PlanMe
 		var dag dsl.DAG
 		clean := sanitizeToJSON(out)
 		lastOut = clean
+		if err := ValidateJSONSchema([]byte(clean)); err != nil {
+			lastErr = err
+			continue
+		}
 		if err := json.Unmarshal([]byte(clean), &dag); err != nil {
 			lastErr = fmt.Errorf("dag json unmarshal: %w", err)
 			continue
